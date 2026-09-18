@@ -131,3 +131,128 @@ test("CRLF-framed streams are recognized at their boundaries", async () => {
   assert.ok(heartbeats(read()).length >= 1, read());
   heartbeat.destroy();
 });
+
+// The local route is the only one whose silence precedes its first event: a
+// cold GPT-OSS-20B prefill reads the whole prompt before llama.cpp can emit
+// `response.created`, so there is no identity to repeat and the identity-only
+// heartbeat has nothing to send. It relays a bare transport-liveness event
+// instead, and stops doing so the moment a real identity exists.
+const KEEPALIVE_BLOCK = /event: codex\.router\.keepalive\ndata: [^\n]*\n\n/g;
+
+function keepalives(text) {
+  return [...text.matchAll(KEEPALIVE_BLOCK)].map((match) =>
+    JSON.parse(match[0].slice(match[0].indexOf("data: ") + 6)),
+  );
+}
+
+function localHeartbeat(intervalMs) {
+  return new ResponsesHeartbeatTransform({
+    intervalMs,
+    preIdentityEventType: "codex.router.keepalive",
+  });
+}
+
+test("a local stream that has emitted nothing yet still relays liveness", async () => {
+  const heartbeat = localHeartbeat(40);
+  const read = collect(heartbeat);
+  // No upstream byte arrives at all: this is the cold-prefill window, and the
+  // timer has to have been armed without a chunk to arm it.
+  await delay(150);
+  const beats = keepalives(read());
+  assert.ok(beats.length >= 2, read());
+  heartbeat.destroy();
+});
+
+test("the pre-identity event carries no fabricated response identity", async () => {
+  const heartbeat = localHeartbeat(30);
+  const read = collect(heartbeat);
+  await delay(110);
+  const beats = keepalives(read());
+  assert.ok(beats.length >= 1, read());
+  assert.deepEqual(beats[0], { type: "codex.router.keepalive" });
+  const serialized = JSON.stringify(beats);
+  for (const invented of ["\"response\"", "\"id\"", "\"usage\"", "\"output\"", "resp_"]) {
+    assert.equal(serialized.includes(invented), false, `${invented} was fabricated: ${serialized}`);
+  }
+  heartbeat.destroy();
+});
+
+test("the real response follows the pre-identity keepalives unchanged", async () => {
+  const heartbeat = localHeartbeat(40);
+  const read = collect(heartbeat);
+  await delay(110);
+  assert.ok(keepalives(read()).length >= 1, read());
+  heartbeat.write(CREATED);
+  heartbeat.write(REASONING);
+  heartbeat.end(COMPLETED);
+  await new Promise((resolve) => heartbeat.once("end", resolve));
+  const text = read();
+  assert.equal(
+    text.replace(KEEPALIVE_BLOCK, "").replace(HEARTBEAT_BLOCK, ""),
+    CREATED + REASONING + COMPLETED,
+  );
+});
+
+test("a route that did not opt in stays silent through the same silence", async () => {
+  // Same empty stream as the local case above; the only difference is the
+  // absent opt-in. Hosted routes must gain no new bytes on the wire.
+  const heartbeat = new ResponsesHeartbeatTransform({ intervalMs: 30 });
+  const read = collect(heartbeat);
+  await delay(140);
+  assert.equal(read(), "");
+  heartbeat.destroy();
+});
+
+test("once an identity exists the transport event gives way to the identity heartbeat", async () => {
+  const heartbeat = localHeartbeat(40);
+  const read = collect(heartbeat);
+  await delay(110);
+  assert.ok(keepalives(read()).length >= 1, read());
+  heartbeat.write(CREATED);
+  await delay(140);
+  const text = read();
+  assert.ok(heartbeats(text).length >= 1, "expected an identity-only heartbeat after response.created");
+  const afterCreated = text.slice(text.indexOf(CREATED) + CREATED.length);
+  assert.equal(keepalives(afterCreated).length, 0, "the transport event must stop once identity exists");
+  heartbeat.destroy();
+});
+
+test("a pre-identity keepalive is never spliced into a partially relayed event", async () => {
+  const heartbeat = localHeartbeat(30);
+  const read = collect(heartbeat);
+  heartbeat.write('event: response.created\ndata: {"type":"response.created","response":');
+  await delay(120);
+  assert.equal(keepalives(read()).length, 0, "a keepalive interrupted a partial first event");
+  heartbeat.write('{"id":"resp_1"}}\n\n');
+  await delay(110);
+  const text = read();
+  assert.ok(
+    keepalives(text).length + heartbeats(text).length >= 1,
+    "liveness resumes at the next event boundary",
+  );
+  heartbeat.destroy();
+});
+
+test("the pre-identity timer stops when the stream ends", async () => {
+  const heartbeat = localHeartbeat(30);
+  const read = collect(heartbeat);
+  await delay(70);
+  assert.ok(keepalives(read()).length >= 1, read());
+  heartbeat.end(COMPLETED);
+  await new Promise((resolve) => heartbeat.once("end", resolve));
+  const settled = read();
+  await delay(140);
+  assert.equal(read(), settled, "a keepalive fired after the stream ended");
+});
+
+test("the pre-identity timer stops when the stream is destroyed", async () => {
+  const heartbeat = localHeartbeat(30);
+  const read = collect(heartbeat);
+  heartbeat.on("error", () => {});
+  await delay(70);
+  assert.ok(keepalives(read()).length >= 1, read());
+  heartbeat.destroy(new Error("upstream failed"));
+  const settled = read();
+  await delay(160);
+  assert.equal(read(), settled, "a keepalive fired after the stream was destroyed");
+});

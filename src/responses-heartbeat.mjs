@@ -15,6 +15,17 @@ import { Transform } from "node:stream";
 // stream itself announced, only at an SSE event boundary, only after the client
 // has seen `response.created`, and never after a terminal event. It is the
 // last stage before the client, so no router transform ever parses it.
+//
+// A local model needs the same liveness without ever having an identity to
+// repeat. GPT-OSS-20B cannot emit `response.created` until it has finished
+// reading the whole prompt, and on this 16 GB Mac that is minutes of total
+// silence while a cold prefill runs. The identity-only heartbeat above has
+// nothing to send during that window, so the client's idle timer expires on a
+// turn that is still healthy. With `preIdentityEventType` set the transform
+// arms itself on construction and, until a response identity exists, relays
+// that single application-level event instead. It is a transport-liveness
+// event and nothing else: no response object, no id, no usage, no content. A
+// client that does not recognize it has learned only that the socket is open.
 const TERMINAL_EVENT_TYPES = new Set([
   "response.completed",
   "response.failed",
@@ -22,10 +33,18 @@ const TERMINAL_EVENT_TYPES = new Set([
   "response.done",
   "error",
 ]);
+// The pre-identity event must not collide with a Responses lifecycle type, or
+// a client that renders unknown-but-namespaced events would try to project it
+// onto a turn that has not started.
+const DEFAULT_PRE_IDENTITY_EVENT_TYPE = "codex.router.keepalive";
 const SNAPSHOT_EVENT_TYPES = new Set(["response.created", "response.in_progress"]);
 // The announcing event can carry the full instructions and tool list. Parse it
 // only within this bound; a larger one simply leaves the heartbeat off.
 const MAX_SNAPSHOT_EVENT_CHARS = 4 * 1024 * 1024;
+
+function preIdentityBlock(eventType) {
+  return `event: ${eventType}\ndata: ${JSON.stringify({ type: eventType })}\n\n`;
+}
 
 function eventOf(block) {
   let eventType;
@@ -54,15 +73,28 @@ function responseIdentity(response) {
 
 export class ResponsesHeartbeatTransform extends Transform {
   #intervalMs;
+  #preIdentityEvent;
   #decoder = new StringDecoder("utf8");
   #parseBuffer = "";
   #identity;
   #terminal = false;
   #timer;
 
-  constructor({ intervalMs }) {
+  constructor({ intervalMs, preIdentityEventType } = {}) {
     super();
     this.#intervalMs = intervalMs;
+    // Opt-in. Grok's stream always announces itself before it goes quiet, so a
+    // pre-identity event would be a new behaviour on a hosted route for no
+    // gain; only the local routes pass this.
+    this.#preIdentityEvent =
+      preIdentityEventType === undefined
+        ? undefined
+        : typeof preIdentityEventType === "string" && preIdentityEventType.length > 0
+          ? preIdentityEventType
+          : DEFAULT_PRE_IDENTITY_EVENT_TYPE;
+    // The silence this exists for happens before the first upstream byte, so
+    // the timer cannot wait for `_transform` to arm it.
+    if (this.#preIdentityEvent !== undefined) this.#arm();
   }
 
   _transform(chunk, _encoding, callback) {
@@ -130,13 +162,19 @@ export class ResponsesHeartbeatTransform extends Transform {
     if (this.#terminal || this.destroyed || this.writableEnded) return;
     // Mid-event bytes are still owed to the client; a heartbeat there would
     // corrupt the event being relayed.
-    if (this.#identity && this.#parseBuffer === "") {
+    if (this.#parseBuffer !== "") {
+      this.#arm();
+      return;
+    }
+    if (this.#identity) {
       this.push(
         `event: response.in_progress\ndata: ${JSON.stringify({
           type: "response.in_progress",
           response: this.#identity,
         })}\n\n`,
       );
+    } else if (this.#preIdentityEvent !== undefined) {
+      this.push(preIdentityBlock(this.#preIdentityEvent));
     }
     this.#arm();
   }
