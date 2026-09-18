@@ -15,6 +15,7 @@ import { withAtomicStateLock } from "./atomic-state-lock.mjs";
 import { writePrivateJson } from "./file-security.mjs";
 import { STATE_DIR } from "./paths.mjs";
 import { processStartIdentity, stateOwnsProcess } from "./process-identity.mjs";
+import { readSystemMemory } from "./system-memory.mjs";
 
 // GPT-OSS-20B on llama.cpp is the heaviest thing this router can start: the
 // MXFP4 weights are 11.27 GiB and the machine is 16 GB. Everything here exists
@@ -64,8 +65,18 @@ const START_TIMEOUT_MS = Number(process.env.CODEX_ROUTER_LOCAL_START_TIMEOUT_MS)
   ? Number(process.env.CODEX_ROUTER_LOCAL_START_TIMEOUT_MS)
   : 180_000;
 const PROBE_TIMEOUT_MS = 2_000;
-const STOP_TIMEOUT_MS = 20_000;
 const STOP_POLL_MS = 250;
+// An 11 GiB unload is not a 20-second operation once macOS is short on memory,
+// and a stop that escalates to SIGKILL mid-unload is the path the comments
+// above warn about. The grace window is therefore generous by default and
+// configurable, while SIGKILL stays as the last resort.
+const STOP_GRACE_MS = Number(process.env.CODEX_ROUTER_LOCAL_STOP_GRACE_MS) > 0
+  ? Number(process.env.CODEX_ROUTER_LOCAL_STOP_GRACE_MS)
+  : 60_000;
+// "The port answered a moment ago" and "the port is free" are different
+// claims. A single ECONNREFUSED is a transient, and the restart that follows
+// one used to die on a bind error; quiescence means the socket stayed free.
+const PORT_QUIESCENCE_MS = 1_000;
 // Releasing the port is not the same event as the process leaving the process
 // table. An 11 GiB unload takes real time, and during that window a fresh server
 // binds nothing and dies at once with "couldn't bind HTTP server socket". A
@@ -258,12 +269,22 @@ export async function waitForLlamacppPortFree({
   fetchImpl = fetch,
   timeoutMs = PORT_RELEASE_TIMEOUT_MS,
   intervalMs = PORT_RELEASE_POLL_MS,
+  stableMs = PORT_QUIESCENCE_MS,
 } = {}) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const probe = await probeLlamacpp({ baseUrl, fetchImpl });
     // Any HTTP answer, healthy or not, means somebody still holds the socket.
-    if (!probe.reachable) return true;
+    if (!probe.reachable) {
+      // One refusal can be a transient. Free means it stays free across a
+      // second look, which is the claim a restart actually depends on.
+      if (stableMs > 0) {
+        await wait(stableMs);
+        const confirm = await probeLlamacpp({ baseUrl, fetchImpl });
+        if (confirm.reachable) continue;
+      }
+      return true;
+    }
     if (Date.now() >= deadline) return false;
     await wait(intervalMs);
   }
@@ -272,7 +293,7 @@ export async function waitForLlamacppPortFree({
 export async function stopManagedLlamacpp({
   identity = processStartIdentity,
   kill = process.kill,
-  timeoutMs = STOP_TIMEOUT_MS,
+  timeoutMs = STOP_GRACE_MS,
   intervalMs = STOP_POLL_MS,
   baseUrl = process.env.MODEL_ROUTER_LLAMACPP_BASE_URL || DEFAULT_LLAMACPP_BASE_URL,
   fetchImpl = fetch,
@@ -498,10 +519,39 @@ export async function startManagedLlamacpp({
   kill = process.kill,
   timeoutMs = START_TIMEOUT_MS,
   expectedModel = DEFAULT_LLAMACPP_MODEL,
+  portReleaseTimeoutMs = PORT_RELEASE_TIMEOUT_MS,
 } = {}) {
   const initial = await probeLlamacpp({ baseUrl, fetchImpl });
   if (initial.ready) {
     return { started: false, alreadyRunning: true, ...initial };
+  }
+
+  // The start barrier. A teardown still in flight owns this port, and nothing
+  // good comes from racing it: that is what produced a storm of servers that
+  // bound nothing and exited in four seconds.
+  await awaitLocalRuntimeCleanup();
+
+  // Somebody is answering on our port and it is not the process this router
+  // started. Either it is our own previous copy still winding down -- in which
+  // case wait it out -- or it belongs to somebody else, in which case fail
+  // closed and name it. Never signal a process we cannot prove is ours.
+  const occupant = await probeLlamacpp({ baseUrl, fetchImpl });
+  if (occupant.reachable) {
+    const freed = await waitForLlamacppPortFree({
+      baseUrl,
+      fetchImpl,
+      timeoutMs: portReleaseTimeoutMs,
+    });
+    if (!freed && !startingStateOwnedByLiveProcess({ identity: processIdentity })) {
+      const error = new Error(
+        `${llamacppRootUrl(baseUrl)} is answering but Codex Router has no managed ` +
+          "llama.cpp process that owns it. Refusing to start into a port that " +
+          "belongs to another process; stop that server or point " +
+          "MODEL_ROUTER_LLAMACPP_BASE_URL at a free port.",
+      );
+      error.code = "ERR_LLAMACPP_PORT_CONFLICT";
+      throw error;
+    }
   }
 
   let spawnedPid;
@@ -647,6 +697,7 @@ export async function llamacppStatus({
   let served;
   if (probe.ready) served = await llamacppServedModels({ baseUrl, fetchImpl });
   const activity = probe.ready ? await llamacppSlotActivity({ baseUrl, fetchImpl }) : undefined;
+  const systemMemory = readSystemMemory();
   const mismatched =
     Boolean(probe.ready && expectedModel && served?.models?.length) &&
     !served.models.includes(expectedModel);
@@ -678,6 +729,10 @@ export async function llamacppStatus({
     activeInference: activity?.busy,
     cleanupInProgress: localRuntimeCleanupInProgress(),
     idleStopMs: localRuntimeIdleStopMs(),
+    stopGraceMs: STOP_GRACE_MS,
+    // What the machine has left, so "why is this slow" has an answer that is
+    // not a guess. Advisory only: nothing refuses to run because of it.
+    system: systemMemory,
     uptimeMs: owned && state?.startedAt ? Date.now() - state.startedAt : undefined,
     // Deliberately named for what it is. This is the server process's resident
     // set, and llama.cpp's Metal buffers are not all counted in it, so the

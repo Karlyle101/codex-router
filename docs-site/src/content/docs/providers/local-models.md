@@ -199,6 +199,7 @@ next write.
 
 
 
+
 ## GPT-OSS-20B on llama.cpp
 
 `llamacpp/gpt-oss-20b` is a local route served by llama.cpp rather than Ollama
@@ -406,9 +407,66 @@ Tasks share one working root on purpose: the cwd is part of Codex's environment
 context, so a fresh directory per task would make the model re-read its whole
 8.5K-token preamble seven times.
 
-The suite has not yet produced a clean full run on this machine. A gated run
-recorded Q1 as FAIL: it hit the six-minute bound with zero tool calls, because
-the model was still loading under memory pressure that had system memory at 5%
-free and swap nearly full. That is a machine-state result, not a capability
-verdict, and it should be read that way. Re-run the suite on an otherwise idle
-machine before drawing conclusions about the model.
+**It has not produced a clean run yet, and no capability profile exists.** In
+the most recent attempt Q1 hit its eight-minute bound with zero tool calls. That
+was measured while the machine had a resident 11.5 GiB model, roughly 4-10%
+memory available, and swap in use, and while individual routed turns were taking
+142-441 seconds where a clean machine does the same work in 47-229. The record
+is therefore classified `environment`, not `model`.
+
+Until the suite runs on a machine that has been restarted and is otherwise
+quiet, treat every capability statement about this model as unqualified. The one
+thing that is established is that it genuinely drives Codex tools, from the
+earlier routed shell, warm shell, and file-creation proofs.
+
+### Stopping gracefully, and starting safely
+
+Stopping is one operation shared by the CLI, the cancellation cleanup, and the
+idle reaper. It sends `SIGTERM`, waits out `CODEX_ROUTER_LOCAL_STOP_GRACE_MS`
+(default 60000) for the process to leave, and only then escalates to `SIGKILL`.
+The twenty-second ceiling it replaced was too tight for an 11 GiB unload on a
+busy machine, which is why stops used to report `forced: true`. A normal stop
+now reports:
+
+```json
+{"stopped":true,"pid":7031,"forced":false,"portFree":true}
+```
+
+measured at 3.9 seconds end to end, with memory returning to 83% free.
+
+Two things that look like the same event are not: the process leaving the
+process table, and the port becoming usable again. A single refused connection
+is a transient, so `STOPPED` now requires the socket to stay free across a
+second look. That is what closes the old sequence of stop, immediate start, bind
+failure, second start succeeds.
+
+Starting has its own barrier. It waits for any teardown still in flight, then:
+
+```text
+port answering, and it is our managed process  → wait for it, or use it
+port answering, and nothing here owns it        → FAIL CLOSED
+nothing answering                               → launch
+```
+
+A foreign server on the port is never signalled; the start fails with
+`ERR_LLAMACPP_PORT_CONFLICT` and says which setting to change. An unattended
+router should not be guessing about process ownership.
+
+### Resource preflight
+
+```text
+./bin/local-llamacpp doctor
+```
+
+reports available memory, swap in use, compression, wired memory, and the
+runtime's own state, and exits non-zero when the machine is in no shape to load
+an 11 GiB model. `status` carries the same reading under `system`.
+
+It is advisory for normal use. The measurement harness is the one caller that
+treats it as a gate, because spending minutes loading a model into a thrashing
+machine and then recording a timeout as a model failure is a bad experiment.
+When a task does time out, the qualification record carries
+`classification: "environment"` rather than a silent FAIL, so the two are never
+read as the same thing. The gate does not apply when the model is already
+resident: 11.5 GiB of a 16 GB machine is legitimately unavailable, and that is
+the state the harness most wants to measure in.

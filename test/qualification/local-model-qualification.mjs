@@ -12,7 +12,14 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 
+import { readSystemMemory } from "../../src/system-memory.mjs";
+
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+
+// A run only means something if the machine could have run it. This is the
+// distinction the previous attempt got wrong: eleven minutes of swap-thrash
+// while the model was still loading was recorded as a model failure.
+export const ENVIRONMENT_FAILURE_EXIT = 2;
 
 // The agreed bound: past the initial warm-up a task that has not made
 // meaningful progress by here is recorded as a failure rather than allowed to
@@ -258,6 +265,7 @@ async function runTask(task, { model, timeoutMs, codexBin, root }) {
   const prompt = `Work in this directory: ${dir}\n\n${task.prompt}`;
 
   const started = Date.now();
+  const memoryAtStart = readSystemMemory();
   const run = await runCapture(
     codexBin,
     [
@@ -296,6 +304,17 @@ async function runTask(task, { model, timeoutMs, codexBin, root }) {
     toolCalls: parsed.toolCalls.length,
     edited: parsed.toolCalls.some((call) => /apply_patch|>|>>|sed -i|printf/.test(call.command || "")),
     timedOut: run.timedOut,
+    // A timeout on a machine that was out of memory is not evidence about the
+    // model. Keeping the reason beside the verdict is what stops the two being
+    // read as the same thing.
+    memoryAtStart,
+    classification: !outcome.pass && run.timedOut && memoryAtStart.pressure !== "normal"
+      ? "environment"
+      : run.timedOut
+        ? "runtime"
+        : outcome.pass
+          ? "pass"
+          : "model",
   };
   rmSync(dir, { recursive: true, force: true });
   return record;
@@ -326,23 +345,115 @@ async function main() {
   const only = process.env.QUALIFY_ONLY ? new Set(process.env.QUALIFY_ONLY.split(",")) : null;
   const timeoutMs = Number(process.env.QUALIFY_TIMEOUT_MS || DEFAULT_TIMEOUT_MS);
 
+  const { llamacppStatus, startManagedLlamacpp, stopManagedLlamacpp } = await import(
+    "../../src/llamacpp-runtime.mjs"
+  );
+
+  async function snapshot(at) {
+    const system = readSystemMemory();
+    const status = await llamacppStatus().catch(() => ({}));
+    return {
+      at,
+      pressure: system.pressure,
+      availablePercent: system.availablePercent,
+      swapUsedBytes: system.swapUsedBytes,
+      llamaResidentBytes: status.residentBytes,
+      activeInference: status.activeInference,
+    };
+  }
+
+  const statusBefore = await llamacppStatus().catch(() => ({}));
+  const runtimeAlreadyWarm = Boolean(statusBefore.ready);
+
+  // Refuse before spending minutes on a load the machine cannot afford, and
+  // never let that refusal look like a model verdict.
+  //
+  // The gate is about paying for a load, so it only applies when there is one
+  // to pay for. An already-resident model is *why* free memory looks alarming:
+  // 11.5 GiB of a 16 GB machine is legitimately unavailable while it is loaded,
+  // and refusing on that reading would make the harness unusable in the exact
+  // state it is designed to measure.
+  const before = readSystemMemory();
+  if (before.pressure === "critical" && !runtimeAlreadyWarm) {
+    process.stdout.write(
+      `\nENVIRONMENT NOT SUITABLE FOR FAIR QUALIFICATION\n` +
+        `${before.reasons.map((reason) => `  - ${reason}`).join("\n")}\n\n` +
+        "No task was run, so no task is recorded as a failure. Close what you can " +
+        "and run again; `local-llamacpp doctor` reports the same reading.\n",
+    );
+    const out = path.join(REPO, "test", "qualification", "last-run.json");
+    writeFileSync(
+      out,
+      `${JSON.stringify(
+        {
+          model,
+          at: new Date().toISOString(),
+          environmentFailure: true,
+          reasons: before.reasons,
+          system: before,
+          records: [],
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    process.stdout.write(`wrote ${out}\n`);
+    process.exitCode = ENVIRONMENT_FAILURE_EXIT;
+    return;
+  }
+
   const root = mkdtempSync(path.join(os.tmpdir(), "localq-root-"));
-  // A warmed prefix is the difference between a two-minute task and a
-  // fifteen-minute one, so the first task pays the cold read for the rest.
+
+  // Load once, up front, so no task's clock includes an 11 GiB read. Measuring
+  // how often macOS can load that file is a different experiment.
+  process.stdout.write("\n--- warming the local runtime ---\n");
+  const loadStarted = Date.now();
+  const warm = await startManagedLlamacpp();
+  const loadMs = Date.now() - loadStarted;
+  process.stdout.write(
+    `${JSON.stringify({ loaded: warm.started, alreadyRunning: warm.alreadyRunning, loadMs })}\n`,
+  );
+
+  const snapshots = [await snapshot("before-load")];
   const records = [];
   for (const task of TASKS) {
     if (only && !only.has(task.id)) continue;
     process.stdout.write(`\n--- ${task.id} ${task.name} ---\n`);
     const record = await runTask(task, { model, timeoutMs, codexBin, root });
     records.push(record);
+    snapshots.push(await snapshot(`after-${task.id}`));
     process.stdout.write(`${formatTable([record])}\n`);
     await delay(1_000);
   }
   rmSync(root, { recursive: true, force: true });
 
   process.stdout.write(`\n${formatTable(records)}\n`);
+
+  // One stop at the end, measured. Repeated load/unload is exactly what the
+  // machine cannot afford, so the suite never does it between fixtures.
+  const stopStarted = Date.now();
+  const stopped = await stopManagedLlamacpp();
+  const stopMs = Date.now() - stopStarted;
+  snapshots.push(await snapshot("after-stop"));
+  process.stdout.write(`\nstop: ${JSON.stringify({ ...stopped, stopMs })}\n`);
+
   const out = path.join(REPO, "test", "qualification", "last-run.json");
-  writeFileSync(out, `${JSON.stringify({ model, at: new Date().toISOString(), records }, null, 2)}\n`);
+  writeFileSync(
+    out,
+    `${JSON.stringify(
+      {
+        model,
+        at: new Date().toISOString(),
+        loadMs,
+        stop: { ...stopped, stopMs },
+        environmentBefore: before,
+        snapshots,
+        records,
+      },
+      null,
+      2,
+    )}\n`,
+  );
   process.stdout.write(`\nwrote ${out}\n`);
   process.exitCode = records.every((record) => record.pass) ? 0 : 1;
 }

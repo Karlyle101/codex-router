@@ -2482,6 +2482,35 @@ async function handleLocalModels(action, value, ...rest) {
       process.stdout.write(`${JSON.stringify(await stopManagedLlamacpp())}\n`);
       return;
     }
+    if (subcommand === "doctor") {
+      // Is this machine in a fit state to run an 11 GiB local model at all?
+      // Deliberately advisory: normal use is never blocked by it, and the exit
+      // code exists so a measurement harness can tell "the machine is thrashing"
+      // apart from "the model cannot do the task".
+      const { readSystemMemory } = await import("./system-memory.mjs");
+      const system = readSystemMemory();
+      const status = await llamacppStatus();
+      const unsuitable = system.pressure === "critical";
+      const report = {
+        suitability: system.pressure,
+        unsuitable,
+        reasons: system.reasons,
+        system,
+        runtime: {
+          state: status.state,
+          managed: status.managed,
+          ready: status.ready,
+          activeInference: status.activeInference,
+          pid: status.pid,
+        },
+        recommendation: unsuitable
+          ? "Close what you can before starting the local model; a load started now will spend minutes in swap and may be measured as a model failure rather than a machine one."
+          : "Enough memory is available to start the local model.",
+      };
+      process.stdout.write(`${JSON.stringify(report)}\n`);
+      if (unsuitable) process.exitCode = 1;
+      return;
+    }
     if (subcommand === "logs") {
       const { readFileSync } = await import("node:fs");
       let body = "";
@@ -2498,7 +2527,9 @@ async function handleLocalModels(action, value, ...rest) {
       );
       return;
     }
-    throw new Error("Usage: control local-models llamacpp status|health|start|stop|logs [N]");
+    throw new Error(
+      "Usage: control local-models llamacpp status|health|doctor|start|stop|logs [N]",
+    );
   }
   if (action === "benchmark") {
     const { benchmarkLocalModel } = await import("./local-benchmark.mjs");
