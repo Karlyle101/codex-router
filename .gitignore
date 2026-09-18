@@ -8,6 +8,9 @@ dist/
 .electron-shots/
 release/
 generated/
+# A qualification run's output, rewritten every run; the methodology that
+# produces it is the artefact worth reviewing, not one machine's snapshot.
+test/qualification/last-run.json
 
 # Upgraded checkouts can retain generated Tauri output after the obsolete
 # tracked shell is removed. Keep the ignores narrow so no replacement source

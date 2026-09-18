@@ -366,9 +366,22 @@ function isGrokOauthRoute(route) {
 // A Grok hop uses a pool whose body idle bound outlasts the stall guard. Every
 // other route keeps the shared pool and Undici's default bound.
 function fetchForRoute(route, url, init) {
-  return isGrokOauthRoute(route)
-    ? longIdleStreamFetch(url, init, { bodyTimeoutMs: GROK_TRANSPORT_IDLE_TIMEOUT_MS })
-    : fetch(url, init);
+  if (isGrokOauthRoute(route)) {
+    return longIdleStreamFetch(url, init, { bodyTimeoutMs: GROK_TRANSPORT_IDLE_TIMEOUT_MS });
+  }
+  // The router's own outbound hop carries the same silence the client hop does:
+  // during a cold local prefill nothing has been written to this leg either.
+  // Undici's shared pool ends a body that stays quiet for 300s, which killed a
+  // real routed turn at 336s with UND_ERR_BODY_TIMEOUT while llama.cpp was still
+  // reading its prompt at 48% -- a failure the client-side keepalive cannot see,
+  // because the connection it would have kept alive was already gone. A separate
+  // pool with a bound that outlasts the guard is what the Grok hop already does;
+  // only the local routes leave the shared pool, so hosted providers keep the
+  // behaviour they have today.
+  if (isLocalRuntimeRoute(route)) {
+    return longIdleStreamFetch(url, init, { bodyTimeoutMs: LOCAL_TRANSPORT_IDLE_TIMEOUT_MS });
+  }
+  return fetch(url, init);
 }
 
 // Codex sends the service tier the operator picked, and a priority tier bills
@@ -3737,6 +3750,92 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
 // Normalize once and age from that pristine input for every route that may
 // actually serve the turn. Ordinary turns compact only consumed old results;
 // the client owns context-pressure detection and whole-history compaction.
+// Local runtimes that the router is allowed to start on its own, keyed by
+// provider id. A local model is not meant to be resident all day -- llama.cpp
+// holds roughly 11 GiB of unified memory here, and the operator asked not to
+// pay that while the model sits idle -- so the first routed turn that needs one
+// brings it up. Keeping this a table rather than an `if` keeps the request path
+// free of per-model special cases and makes a second local runtime a one-line
+// addition.
+const LOCAL_RUNTIME_ENSURE = new Map([
+  ["llamacpp", async () => (await import("./llamacpp-runtime.mjs")).startManagedLlamacpp()],
+]);
+
+// A local model cannot emit its first byte until it has read the entire prompt,
+// and Codex's routed prompt is 17-22K tokens. At the ~30 tok/s this machine
+// manages, that is minutes of total silence on the wire -- indistinguishable
+// from a dead upstream under the ordinary 30s prelude bound, which would fail
+// the prelude and retry forever without ever letting the model answer. The same
+// table that says "the router may start this runtime" also says "its silence
+// means work, not failure".
+const LOCAL_RUNTIME_PRELUDE_MS =
+  Number(process.env.CODEX_ROUTER_LOCAL_PRELUDE_MS) > 0
+    ? Number(process.env.CODEX_ROUTER_LOCAL_PRELUDE_MS)
+    : 15 * 60_000;
+
+// Same interval as the Grok heartbeat, and for the same reason: a local model
+// that has not finished reading its prompt has nothing to say, and five minutes
+// of that silence makes Codex abandon a live turn and re-send it.
+const LOCAL_RUNTIME_HEARTBEAT_MS =
+  Number(process.env.CODEX_ROUTER_LOCAL_HEARTBEAT_MS) > 0
+    ? Number(process.env.CODEX_ROUTER_LOCAL_HEARTBEAT_MS)
+    : 60_000;
+
+// How long the router's own connection to the gateway may sit silent before
+// Undici gives up on it. It has to outlast the local prelude budget above, or
+// the guard is merely waiting for a socket somebody else already closed: the
+// first real cold routed turn died at 336s with a BodyTimeoutError while the
+// model was still reading its prompt. The next bound above this one is the
+// gateway's own configured request timeout.
+const LOCAL_TRANSPORT_IDLE_TIMEOUT_MS =
+  Number(process.env.CODEX_ROUTER_LOCAL_TRANSPORT_IDLE_MS) > 0
+    ? Number(process.env.CODEX_ROUTER_LOCAL_TRANSPORT_IDLE_MS)
+    : LOCAL_RUNTIME_PRELUDE_MS + 60_000;
+
+function isLocalRuntimeRoute(route) {
+  return Boolean(route && LOCAL_RUNTIME_ENSURE.has(canonicalProviderId(route.provider)));
+}
+
+// Local turns currently being served. Cancellation cleanup has to be able to
+// ask whether the slot it is about to reclaim belongs to somebody else still
+// waiting for an answer, and with `--parallel 1` a busy slot does not say which
+// turn is using it. Keyed on the request object so the state is request-scoped
+// and disappears with the request.
+const localTurnsInFlight = new Set();
+
+function otherLocalTurnsActive(request) {
+  for (const other of localTurnsInFlight) {
+    if (other !== request) return true;
+  }
+  return false;
+}
+
+async function ensureLocalRouteRuntime(route, request) {
+  const provider = providerForModel(route);
+  const ensure = provider ? LOCAL_RUNTIME_ENSURE.get(provider.id) : undefined;
+  if (!ensure) return;
+  try {
+    // A request arriving during a cancellation teardown waits for it rather
+    // than starting a server the teardown is about to stop.
+    if (request) {
+      const { awaitLocalRuntimeCleanup } = await import("./llamacpp-runtime.mjs");
+      await awaitLocalRuntimeCleanup();
+    }
+    await ensure();
+    if (request) localTurnsInFlight.add(request);
+  } catch (error) {
+    // A local backend that cannot start is an operator-actionable condition,
+    // not a proxy fault: say which command fixes it and where the log is.
+    const wrapped = new Error(
+      `The local runtime behind ${route.slug} could not be started: ` +
+        `${error instanceof Error ? error.message : String(error)} ` +
+        "Start it by hand with `codex-router local-llamacpp start`.",
+    );
+    wrapped.status = 503;
+    throw wrapped;
+  }
+}
+
 async function prepareRoutedRequest({
   request,
   payload,
@@ -3744,6 +3843,7 @@ async function prepareRoutedRequest({
   normalizedInput,
   agingEnabled,
 }) {
+  await ensureLocalRouteRuntime(route, request);
   const aged = ageToolResults(normalizedInput, {
     enabled: agingEnabled,
   });
@@ -4669,14 +4769,18 @@ async function handleResponses(request, response, requestUrl) {
         ? invalidCompletedFunctionCallTransform(flattenedNamespaces, contentType)
         : undefined;
       if (invalidFunctionCall) transforms.push(invalidFunctionCall);
+      const routePreludeMs =
+        isLocalRuntimeRoute(route)
+          ? Math.max(LOCAL_RUNTIME_PRELUDE_MS, EMPTY_COMPLETION_PRELUDE_MS)
+          : EMPTY_COMPLETION_PRELUDE_MS;
       const guard =
         route && EMPTY_COMPLETION_RETRY
           ? new EmptyCompletionGuard(contentType, {
               maxPreludeBytes: EMPTY_COMPLETION_PRELUDE_BYTES,
-              maxPreludeMs: EMPTY_COMPLETION_PRELUDE_MS,
+              maxPreludeMs: routePreludeMs,
               maxStreamStallMs: canonicalProviderId(route.provider) === "grok-oauth"
                 ? GROK_STREAM_STALL_MS
-                : EMPTY_COMPLETION_PRELUDE_MS,
+                : routePreludeMs,
             })
           : undefined;
       if (guard) {
@@ -4721,13 +4825,32 @@ async function handleResponses(request, response, requestUrl) {
       // always wins. Native streams already carry the label and gain no stage.
       const messagePhase = route ? messagePhaseTransform(contentType) : undefined;
       if (messagePhase) transforms.push(messagePhase);
-      // Last, so no router stage ever parses a heartbeat: while a Grok stream is
+      // Last, so no router stage ever parses a heartbeat: while a stream is
       // silent, keep the client's idle timer from abandoning a live turn.
+      //
+      // Two routes legitimately go quiet for longer than Codex's five-minute
+      // stream-idle bound: Grok, which reasons for minutes after announcing
+      // itself, and a local model, which must read the whole prompt before it
+      // can emit its first byte at all. This is not a timeout change. Grok's
+      // heartbeat only ever repeats the identity the stream itself announced;
+      // the local route additionally relays a bare transport-liveness event
+      // while it has no identity yet, because during a cold prefill there is
+      // nothing to repeat. A hosted route that never goes quiet is unaffected
+      // either way.
+      const grokHeartbeat = isGrokOauthRoute(route);
+      const localHeartbeat = isLocalRuntimeRoute(route);
       if (
-        isGrokOauthRoute(route) &&
+        (grokHeartbeat || localHeartbeat) &&
         String(contentType).toLowerCase().includes("text/event-stream")
       ) {
-        transforms.push(new ResponsesHeartbeatTransform({ intervalMs: GROK_HEARTBEAT_MS }));
+        transforms.push(
+          new ResponsesHeartbeatTransform({
+            intervalMs: grokHeartbeat ? GROK_HEARTBEAT_MS : LOCAL_RUNTIME_HEARTBEAT_MS,
+            // Only the local route opts in: its silence precedes its first
+            // event, so it has no response identity to repeat yet.
+            ...(localHeartbeat ? { preIdentityEventType: "codex.router.keepalive" } : {}),
+          }),
+        );
       }
       return { transforms, usageObserver, guard, leakedToolCalls };
     };
@@ -5325,6 +5448,33 @@ async function handleResponses(request, response, requestUrl) {
   } finally {
     const status = activityStatus ?? finalStatus ?? response.statusCode;
     activity.finish(status);
+    // A local turn that ended because the client walked away leaves llama.cpp
+    // generating into an empty room. This build has no way to cancel inference
+    // and does not notice on its own, so the runtime reclaims the server it
+    // started after a short grace period. `clientGone` alone would miss the
+    // ordering where the socket closes as the pipeline is already unwinding,
+    // so the destroyed-without-finishing shape counts too -- the same reading
+    // the stream-error paths above use.
+    if (isLocalRuntimeRoute(route)) {
+      const cancelled = clientGone || (response.destroyed && !response.writableFinished);
+      localTurnsInFlight.delete(request);
+      const { cleanupAfterLocalCancellation, noteLocalRuntimeIdle } = await import(
+        "./llamacpp-runtime.mjs"
+      );
+      const otherTurnsActive = () => otherLocalTurnsActive(request);
+      if (cancelled) {
+        // Nobody is waiting on the response any more, so this must not hold the
+        // handler open.
+        void cleanupAfterLocalCancellation({ otherTurnsActive }).catch((error) => {
+          console.error(
+            `[codex-router] local cancellation cleanup failed: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        });
+      }
+      noteLocalRuntimeIdle({ otherTurnsActive });
+    }
     // Timestamped per-request timing for latency diagnosis. Never gated on
     // QUIET: the production LaunchAgent hard-sets CODEX_ROUTER_QUIET=1. A
     // missing provider count is logged as unknown, not zero; an explicit zero

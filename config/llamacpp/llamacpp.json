@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "providers": [
+    {
+      "id": "llamacpp",
+      "displayName": "llama.cpp (Local)",
+      "kind": "openai-compatible",
+      "ownedBy": "llamacpp",
+      "protocol": "openai",
+      "baseUrl": "http://127.0.0.1:8080/v1",
+      "baseUrlEnv": "MODEL_ROUTER_LLAMACPP_BASE_URL",
+      "keyless": true,
+      "planNote": "Runs on this machine through llama.cpp. The router starts llama-server on demand and hands out no credentials because the endpoint is loopback-only."
+    }
+  ]
+}

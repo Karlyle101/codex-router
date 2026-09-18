@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "models": [
+    {
+      "slug": "llamacpp/gpt-oss-20b",
+      "gatewayModel": "llamacpp-gpt-oss-20b",
+      "upstreamModel": "gpt-oss-20b",
+      "provider": "llamacpp",
+      "listed": true,
+      "displayName": "GPT-OSS-20B (local llama.cpp)",
+      "description": "OpenAI's gpt-oss-20b running on this Mac through llama.cpp at MXFP4. Free, private, and offline: no prompt leaves the machine. Verified dispatching real Codex shell, patch, and file tools. Realistically a useful local coding/tool worker rather than a strong autonomous engineer, and it shares unified memory with everything else you have open.",
+      "priority": 960,
+      "defaultEffort": "medium",
+      "reasoningLevels": [
+        {
+          "effort": "low",
+          "description": "Shortest thinking; fastest turns"
+        },
+        {
+          "effort": "medium",
+          "description": "Balanced; the model's own default"
+        },
+        {
+          "effort": "high",
+          "description": "Longer thinking; slower but more thorough"
+        }
+      ],
+      "contextWindow": 32768,
+      "autoCompact": 28000,
+      "inputModalities": [
+        "text"
+      ],
+      "isFree": true,
+      "compHash": "llamacpp-gpt-oss-20b-v1"
+    }
+  ]
+}

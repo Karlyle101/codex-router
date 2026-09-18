@@ -2446,6 +2446,91 @@ async function handleLocalModels(action, value, ...rest) {
     }
     throw new Error("Usage: control local-models runtime status|start [--yes]|update --yes");
   }
+  if (action === "llamacpp") {
+    // The llama.cpp runtime is separate from Ollama's because the two answer
+    // different questions. Ollama owns its own weights and daemon; here the
+    // router starts one operator-supplied launcher, on demand, and must be able
+    // to prove the server it stops is the server it started.
+    const {
+      llamacppStatus,
+      startManagedLlamacpp,
+      stopManagedLlamacpp,
+      LLAMACPP_LOG_PATH,
+    } = await import("./llamacpp-runtime.mjs");
+    const subcommand = String(value || "status").trim();
+    if (subcommand === "status") {
+      process.stdout.write(`${JSON.stringify(await llamacppStatus())}\n`);
+      return;
+    }
+    if (subcommand === "health") {
+      // Same payload as `status`, but non-zero when the server is not actually
+      // serving. A pid is not health, and a script gating on this needs the
+      // difference to be an exit code rather than a field it might forget.
+      const status = await llamacppStatus();
+      process.stdout.write(`${JSON.stringify(status)}\n`);
+      if (!status.ready) process.exitCode = 1;
+      return;
+    }
+    if (subcommand === "start") {
+      const result = await startManagedLlamacpp();
+      process.stdout.write(
+        `${JSON.stringify({ ...result, status: await llamacppStatus() })}\n`,
+      );
+      return;
+    }
+    if (subcommand === "stop") {
+      process.stdout.write(`${JSON.stringify(await stopManagedLlamacpp())}\n`);
+      return;
+    }
+    if (subcommand === "doctor") {
+      // Is this machine in a fit state to run an 11 GiB local model at all?
+      // Deliberately advisory: normal use is never blocked by it, and the exit
+      // code exists so a measurement harness can tell "the machine is thrashing"
+      // apart from "the model cannot do the task".
+      const { readSystemMemory } = await import("./system-memory.mjs");
+      const system = readSystemMemory();
+      const status = await llamacppStatus();
+      const unsuitable = system.pressure === "critical";
+      const report = {
+        suitability: system.pressure,
+        unsuitable,
+        reasons: system.reasons,
+        system,
+        runtime: {
+          state: status.state,
+          managed: status.managed,
+          ready: status.ready,
+          activeInference: status.activeInference,
+          pid: status.pid,
+        },
+        recommendation: unsuitable
+          ? "Close what you can before starting the local model; a load started now will spend minutes in swap and may be measured as a model failure rather than a machine one."
+          : "Enough memory is available to start the local model.",
+      };
+      process.stdout.write(`${JSON.stringify(report)}\n`);
+      if (unsuitable) process.exitCode = 1;
+      return;
+    }
+    if (subcommand === "logs") {
+      const { readFileSync } = await import("node:fs");
+      let body = "";
+      try {
+        body = readFileSync(LLAMACPP_LOG_PATH, "utf8");
+      } catch {
+        body = "";
+      }
+      const lines = body.split("\n").filter(Boolean);
+      const requested = Number.parseInt(String(positional || ""), 10);
+      const count = Number.isFinite(requested) && requested > 0 ? requested : 40;
+      process.stdout.write(
+        `${JSON.stringify({ path: LLAMACPP_LOG_PATH, lines: lines.slice(-count) })}\n`,
+      );
+      return;
+    }
+    throw new Error(
+      "Usage: control local-models llamacpp status|health|doctor|start|stop|logs [N]",
+    );
+  }
   if (action === "benchmark") {
     const { benchmarkLocalModel } = await import("./local-benchmark.mjs");
     const tag = String(value || "").trim();

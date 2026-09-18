@@ -223,11 +223,55 @@ function withRequiredAppTools(tools, required) {
 const BOUNDED_TOOL_NAME_PROVIDERS = new Set(["commandcode", "commandcode-messages"]);
 const BOUNDED_TOOL_NAME_LENGTH = 64;
 
+// Providers that cannot carry the whole app toolset. The local llama.cpp route
+// is the motivating case: Codex's own prompt plus every injected app, plugin,
+// and MCP tool definition came to roughly 102K tokens against the 32K window
+// this machine serves, so the provider rejected the turn before the model ever
+// saw it. These providers keep every tool the client itself declares and get
+// back only the app tools the transcript or a forced choice actually
+// references -- the same selection Groq already uses to fit inside its hard
+// cap, minus the cap and minus the Groq-specific error.
+//
+// This narrows the *default* local surface. A conversation that really does
+// reference an app tool still gets that tool's definition.
+const LEAN_TOOL_SURFACE_PROVIDERS = new Set(["llamacpp"]);
+
+// Measured on this machine, a single one-line turn to the local route carried
+// 628 KB of request body, of which 576 KB (92%) was tool definitions -- and ten
+// `mcp__` connector namespaces (canva, github, figma, linear, google_drive,
+// atlassian, sites, render, codex_security, supabase) were 92% of that. The
+// core coding tools are tiny by comparison: exec_command is 1.5 KB. A local
+// worker on a 32K window cannot carry a connector catalog it will never call,
+// so unreferenced `mcp__` namespaces are dropped.
+//
+// Everything else is kept byte for byte: every plain function tool, and every
+// namespace Codex itself owns (collaboration, its app toolset). A resumed
+// conversation that actually used a connector keeps that connector, because
+// its name appears in the replayed transcript.
+function leanToolSurface(tools, { input, toolChoice }) {
+  if (!Array.isArray(tools)) return tools;
+  const references = JSON.stringify([input ?? [], toolChoice ?? null]);
+  return tools.filter((tool) => {
+    if (tool?.type !== "namespace") return true;
+    const name = String(tool?.name || "");
+    if (!name.startsWith("mcp__")) return true;
+    return references.includes(name);
+  });
+}
+
 export function chatProviderToolSurface(
   tools,
   providerId,
   { input, toolChoice } = {},
 ) {
+  if (LEAN_TOOL_SURFACE_PROVIDERS.has(providerId)) {
+    // No `mergeCodexAppTools` here: that injection is what pulls the whole app
+    // toolset into every other route, and it is exactly what this route cannot
+    // afford.
+    return flattenNamespaceTools(leanToolSurface(tools, { input, toolChoice }), {
+      aliasCollisions: true,
+    });
+  }
   const merged = mergeCodexAppTools(tools);
   if (providerId !== "groq") {
     return flattenNamespaceTools(
