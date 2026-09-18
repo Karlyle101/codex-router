@@ -200,6 +200,7 @@ next write.
 
 
 
+
 ## GPT-OSS-20B on llama.cpp
 
 `llamacpp/gpt-oss-20b` is a local route served by llama.cpp rather than Ollama
@@ -305,19 +306,48 @@ heartbeat behaviour.
 
 ### What it is good at, and what it is not
 
-It genuinely drives Codex tools: shell execution, file creation, reading a file
-back, and recovering from its own bad path all worked through the routed path
-with real `exit_code` values. It is not a strong autonomous engineer. A
-targeted bug-fix-and-test task was given twenty-five minutes and produced no
-edit. Expect it to be a useful local coding and tool worker for bounded,
-well-specified work, not a replacement for a hosted frontier model.
+#### What it is actually qualified for
+
+Scoped to what has been measured, and no further:
+
+| capability | status | evidence |
+| --- | --- | --- |
+| shell execution | PROVEN | Q1, plus routed cold/warm runs |
+| repository inspection | PROVEN | Q2 |
+| file reading | PROVEN | Q2 |
+| file creation | PROVEN | Q3, exact bytes verified |
+| targeted deterministic edit | PROVEN | Q4 |
+| test authoring and execution | PROVEN | Q5, test reran green here |
+| simple bounded bug repair | PROVEN | Q6, symptom-only prompt |
+| blocker recognition / bounded failure | PROVEN | Q7, no invention |
+| open-ended bug discovery | UNQUALIFIED | not tested |
+| multi-file refactoring | UNQUALIFIED | not tested |
+| architecture | UNQUALIFIED | not tested |
+| security analysis | UNQUALIFIED | not tested |
+| autonomous long-loop work | UNQUALIFIED | not tested |
+| plugins / MCP namespaces | UNQUALIFIED | not tested |
+
+Every PROVEN row is proven for *small, bounded, well-specified* work on the
+fixtures above. None of it implies the same capability on a real repository: the
+fixtures are deliberately tiny, and the one genuinely hard task this model was
+given in an earlier session — an unprescribed bug hunt with no failing test to
+anchor it — ran twenty-five minutes without producing an edit. Q7 passing is
+also a statement about a fixture with an obvious blocker, not about recognising
+a subtle one.
+
+The practical shape: it is a competent local *worker* for mechanical,
+checkable steps, and not an engineer. It is at its best when the next action is
+unambiguous and the result can be verified by running something.
 
 Two practical limits on this hardware:
 
-* Tool loops are slow. A three-tool-turn edit took six minutes, most of it
-  generation at 0.3-2 tokens/second once the machine was tight on memory. Only
-  about 10% of system memory is free while the model's buffer is wired, so run
-  it when you are not also pushing a build through the machine.
+* Throughput depends heavily on the machine's state, and the machine's state
+  depends on how you have been treating it. Warm and unbothered, the runtime
+  measures 88-160 tokens/second prefill and 12.5-16.1 tokens/second generation.
+  After a run of repeated 11 GiB load/unload cycles the same machine fell to
+  4-10 tokens/second and a seven-task suite could not finish. Load it once and
+  leave it: the idle reaper is there for when you are done, not as a per-task
+  habit.
 * Large `mcp__` connector namespaces are filtered out of the default local tool
   surface. Dropping the unreferenced ones took one measured request from
   628,616 to 71,095 bytes. A conversation that actually calls an app tool still
@@ -407,17 +437,61 @@ Tasks share one working root on purpose: the cwd is part of Codex's environment
 context, so a fresh directory per task would make the model re-read its whole
 8.5K-token preamble seven times.
 
-**It has not produced a clean run yet, and no capability profile exists.** In
-the most recent attempt Q1 hit its eight-minute bound with zero tool calls. That
-was measured while the machine had a resident 11.5 GiB model, roughly 4-10%
-memory available, and swap in use, and while individual routed turns were taking
-142-441 seconds where a clean machine does the same work in 47-229. The record
-is therefore classified `environment`, not `model`.
+#### Results — clean machine, 2026-09-18
 
-Until the suite runs on a machine that has been restarted and is otherwise
-quiet, treat every capability statement about this model as unqualified. The one
-thing that is established is that it genuinely drives Codex tools, from the
-earlier routed shell, warm shell, and file-creation proofs.
+One warm runtime, loaded once and never restarted between fixtures, against
+llama.cpp 0.4.1 (build 10964, commit b29c606e2) on this M4/16 GB Mac:
+
+| test | result | time | turns | tools | notes |
+| --- | --- | --- | --- | --- | --- |
+| Q1 shell dispatch | PASS | 67s | 1 | 1 | real `command_execution`, exit 0 |
+| Q2 inspect and read | PASS | 24s | 1 | 2 | walked the tree, read `src/config.ts`, answered 7 |
+| Q3 create file | PASS | 40s | 1 | 2 | exact bytes verified on disk |
+| Q4 targeted edit | PASS | 118s | 1 | 5 | `a - b` → `a + b`, surrounding lines intact |
+| Q5 add and run a test | PASS | 102s | 1 | 5 | regression test added; suite reran it green |
+| Q6 simple bug repair | PASS | 105s | 1 | 6 | symptom-only prompt; diagnosed, patched, test passes |
+| Q7 bounded failure | PASS | 47s | 1 | 3 | named the missing configuration, invented nothing |
+
+Every verdict was decided from the transcript and the file system, never from
+the model's own summary. Q5 and Q6 were re-verified by running the model's own
+artefacts here.
+
+Two earlier attempts are worth recording because they were not model failures.
+In the first, Q2 was marked FAIL by a check that required whitespace before a
+command name while the command arrived shell-quoted (`-lc 'ls -R . | head'`);
+the model had done exactly the right thing, and the check was wrong. That is a
+HARNESS_FAIL and is now fixed. Q3 failed once with `ENOENT` before passing on
+four subsequent runs; the transcript for that attempt was not captured, so it is
+recorded as an unexplained single miss rather than a diagnosed one.
+
+#### Performance and resources during the run
+
+```text
+point         available   swap     llama RSS   pressure
+before load        44%    1.10 GB      0.0 GB   normal
+after load          4%    2.74 GB     10.83 GB   critical
+after Q1            4%    3.03 GB     10.76 GB   critical
+after Q3            6%    3.19 GB     11.02 GB   critical
+after Q5            5%    3.40 GB     10.82 GB   critical
+after Q6            8%    3.85 GB      6.58 GB   critical
+after Q7            4%    3.61 GB      6.18 GB   critical
+after stop         n/a        n/a          n/a   n/a
+```
+
+Throughput held up rather than degrading: **prefill 88-160 tokens/second** and
+**generation 12.5-16.1 tokens/second** across the whole suite. Nothing collapsed,
+and the same warm runtime served all seven fixtures.
+
+The honest reading of that table is that `critical` is the *normal* steady state
+for this configuration, not a fault: the instant an 11 GiB model loads on a
+16 GB machine, free memory is low and macOS starts compressing. What matters is
+whether throughput holds, and it did. The earlier catastrophic run — 4-10
+tokens/second, swap near 12 GB — was a machine that had been driven there by
+repeated load/unload cycles, not the steady state of a warm model.
+
+For comparison, historical observations from the same machine: cold routed shell
+229s, warm routed shell 51s, and a degraded-pressure window where the same turns
+took 142-441s. Those were not part of this run.
 
 ### Stopping gracefully, and starting safely
 

@@ -52,22 +52,34 @@ export const TASKS = [
     id: "Q2",
     name: "inspect and read",
     fixture: {
-      "alpha.txt": "operator token: QUA-7742\n",
-      "beta.txt": "unrelated\n",
-      "notes/inner.txt": "also unrelated\n",
+      "README.md": "# Fixture\n\nA repository used to test file inspection.\n",
+      "src/config.ts":
+        "export const region = \"us-west\";\nexport const retryBudget = 7;\n",
+      "notes.txt": "scratch notes; nothing authoritative lives here\n",
     },
     prompt:
-      "List the files in the current working directory, read alpha.txt, and report " +
-      "the operator token it contains.",
+      "Inspect this repository, including any subdirectories, and report the exact " +
+      "numeric value of the configured retry budget.",
     verdict: ({ toolCalls, finalText }) => {
-      const listed = toolCalls.some((call) => /(^|\s)ls(\s|$)/.test(call.command || ""));
-      const read = toolCalls.some(
-        (call) => /alpha\.txt/.test(call.command || "") && /QUA-7742/.test(call.output || ""),
+      // The value only exists in src/config.ts. It cannot be inferred from the
+      // other two files, so finding it requires actually walking the tree.
+      // The command arrives shell-quoted (`/bin/zsh -lc 'ls -R . | head'`), so
+      // the boundary before a command name is a quote at least as often as it
+      // is a space. Requiring whitespace there misread a correct run as a model
+      // failure.
+      const inspected = toolCalls.some((call) =>
+        /(?:^|[\s'"|;&(])(?:ls|find|rg|grep|cat|sed|tree)(?=\s|$)/.test(
+          call.command || "",
+        ),
       );
-      const answered = /QUA-7742/.test(finalText);
+      const readConfig = toolCalls.some(
+        (call) =>
+          /config\.ts/.test(call.command || "") && /retryBudget/.test(call.output || ""),
+      );
+      const answered = /\b7\b/.test(finalText);
       return {
-        pass: listed && read && answered,
-        note: `list=${listed} read=${read} answered=${answered}`,
+        pass: inspected && readConfig && answered,
+        note: `inspected=${inspected} readConfig=${readConfig} answered=${answered}`,
       };
     },
   },
@@ -118,21 +130,36 @@ export const TASKS = [
     name: "add and run a test",
     fixture: {
       "math.js": "export function add(a, b) {\n  return a + b;\n}\n",
+      "math.test.mjs":
+        'import assert from "node:assert/strict";\n' +
+        'import test from "node:test";\n' +
+        'import { add } from "./math.js";\n\n' +
+        'test("adds positive numbers", () => {\n' +
+        "  assert.equal(add(2, 3), 5);\n" +
+        "});\n",
       "package.json": '{ "type": "module" }\n',
     },
     prompt:
-      "Create a file check.mjs that imports `add` from ./math.js and exits 0 when " +
-      "add(2, 3) is 5, otherwise exits 1. Then run `node check.mjs` and report the " +
-      "exit code.",
+      "This project runs its tests with `node --test`. The `add` function has no " +
+      "coverage for a negative operand. Add one regression test to math.test.mjs " +
+      "covering `add(-1, 1)` returning 0, then run the test file and report what " +
+      "happened.",
     // The suite runs the model's own artefact itself; a test that only exists in
     // the transcript does not count.
     verify: async ({ dir }) => {
-      if (!readdirSync(dir).includes("check.mjs")) return false;
-      return (await runCapture("node", ["check.mjs"], { cwd: dir })).code === 0;
+      let added = false;
+      try {
+        const text = readFileSync(path.join(dir, "math.test.mjs"), "utf8");
+        added = /add\(\s*-1\s*,\s*1\s*\)/.test(text);
+      } catch {
+        return { added: false, runCode: undefined };
+      }
+      const run = await runCapture("node", ["--test", "math.test.mjs"], { cwd: dir });
+      return { added, runCode: run.code };
     },
-    verdict: ({ toolCalls }, verified) => ({
-      pass: verified === true,
-      note: verified ? "test written and passes when run here" : "missing or failing test",
+    verdict: (_session, verified = {}) => ({
+      pass: verified.added === true && verified.runCode === 0,
+      note: `added=${verified.added === true} runExit=${verified.runCode ?? "n/a"}`,
     }),
   },
   {
@@ -148,8 +175,8 @@ export const TASKS = [
       "package.json": '{ "type": "module" }\n',
     },
     prompt:
-      "calc.test.mjs fails. Diagnose the fault in calc.js, fix it, then run " +
-      "`node calc.test.mjs` and report the result.",
+      "`node calc.test.mjs` fails on this project. Work out why and fix the code " +
+      "so the test passes, then run it again and report the result.",
     verify: async ({ dir }) => (await runCapture("node", ["calc.test.mjs"], { cwd: dir })).code === 0,
     verdict: ({ toolCalls }, verified) => {
       const touched = toolCalls.some((call) => /calc\.js/.test(call.command || call.patchPath || ""));
@@ -162,19 +189,32 @@ export const TASKS = [
   {
     id: "Q7",
     name: "bounded failure",
-    // The command cannot succeed: `false` exits 1 and nothing can change that.
-    // The question is whether the model stops and says so, or grinds.
-    fixture: {},
+    // There is no deployment target anywhere in this fixture, and nothing in it
+    // lets one be inferred. The correct behaviour is to name the blocker and
+    // stop, not to invent a plausible value or thrash looking for it.
+    fixture: {
+      "README.md": "# Fixture\n\nNotes about a service that has no deployment target.\n",
+      "src/app.js": "export const name = \"fixture-app\";\nexport const port = 4321;\n",
+      "package.json": '{ "type": "module", "name": "fixture" }\n',
+    },
     prompt:
-      "Run this exact shell command and confirm it exited with status 0:\n\n" +
-      "false\n\nIf it did not exit 0, say so plainly and stop.",
-    verdict: ({ turns, timedOut, lastCommand, finalText }) => ({
-      // A pass here is the harness's behaviour, not the model's success: the
-      // run has to end inside the bound instead of looping. Whether the model
-      // reported the truth is recorded separately.
-      pass: !timedOut,
-      note: `turns=${turns} lastCommand=${lastCommand || "none"} honest=${/not|failed|1|non-?zero/i.test(finalText)}`,
-    }),
+      "Report the deployment target this project is configured to ship to.",
+    verdict: ({ turns, timedOut, finalText, toolCalls }) => {
+      const stopped = !timedOut;
+      // Recognising the blocker reads as an admission, not a value.
+      const recognised =
+        /not (be )?(found|present|configured|defined|specified)|no such|cannot find|can'?t find|does not exist|no deployment target|unable to (find|determine)|missing/i.test(
+          finalText,
+        );
+      // A named target would be an invention: the fixture contains none.
+      const invented = /\b(production|staging|prod|aws|gcp|azure|heroku|vercel|netlify)\b/i.test(
+        finalText,
+      );
+      return {
+        pass: stopped && recognised && !invented,
+        note: `stopped=${stopped} recognisedBlocker=${recognised} invented=${invented} turns=${turns} tools=${toolCalls.length}`,
+      };
+    },
   },
 ];
 
@@ -316,6 +356,15 @@ async function runTask(task, { model, timeoutMs, codexBin, root }) {
           ? "pass"
           : "model",
   };
+  // Classifying a FAIL needs the raw evidence: "edited the wrong line" and "the
+  // suite checked the wrong thing" look identical in a one-line note.
+  const debugDir = process.env.QUALIFY_DEBUG_DIR;
+  if (debugDir) {
+    mkdirSync(debugDir, { recursive: true });
+    writeFileSync(path.join(debugDir, `${task.id}.stdout.jsonl`), run.stdout);
+    writeFileSync(path.join(debugDir, `${task.id}.stderr.txt`), run.stderr);
+    writeFileSync(path.join(debugDir, `${task.id}.record.json`), `${JSON.stringify(record, null, 2)}\n`);
+  }
   rmSync(dir, { recursive: true, force: true });
   return record;
 }
@@ -357,7 +406,9 @@ async function main() {
       pressure: system.pressure,
       availablePercent: system.availablePercent,
       swapUsedBytes: system.swapUsedBytes,
-      llamaResidentBytes: status.residentBytes,
+      // A stopped runtime has no resident set; `undefined` would vanish from
+      // the JSON, so say nothing rather than leaving a hole.
+      llamaResidentBytes: status.residentBytes ?? null,
       activeInference: status.activeInference,
     };
   }
