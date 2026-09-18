@@ -475,12 +475,29 @@ Throughput held up rather than degrading: **prefill 88-160 tokens/second** and
 **generation 12.5-16.1 tokens/second** across the whole suite. Nothing collapsed,
 and the same warm runtime served all seven fixtures.
 
-The honest reading of that table is that `critical` is the *normal* steady state
-for this configuration, not a fault: the instant an 11 GiB model loads on a
-16 GB machine, free memory is low and macOS starts compressing. What matters is
-whether throughput holds, and it did. The earlier catastrophic run — 4-10
-tokens/second, swap near 12 GB — was a machine that had been driven there by
-repeated load/unload cycles, not the steady state of a warm model.
+`critical` is not a fault, but it is not "normal" either: it is *expected for
+this configuration and it means there is no headroom*. An 11 GiB model on a
+16 GB machine leaves almost nothing, which is why macOS reports critical
+pressure from the moment the weights are resident. The finding that matters is
+the next one: critical pressure did **not** produce progressive degradation
+during the controlled warm session. Throughput held, so the machine is not
+unstable — it is simply full.
+
+The practical consequence is about *timing*, not stability. Do not bring this
+model up while something else is about to claim several gigabytes:
+
+```text
+a VM or Android emulator
+a large Docker workload
+an Xcode build
+several heavyweight editor workspaces
+```
+
+Any of those will push the machine from "full but working" into the swap-thrash
+state that produced the catastrophic run — 4-10 tokens/second with swap near
+12 GB — which was a machine driven there by repeated load/unload cycles, not the
+steady state of a warm model. `local-llamacpp doctor` exists to answer exactly
+this question before you start.
 
 For comparison, historical observations from the same machine: cold routed shell
 229s, warm routed shell 51s, and a degraded-pressure window where the same turns
