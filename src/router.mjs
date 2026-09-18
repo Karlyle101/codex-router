@@ -3796,12 +3796,33 @@ function isLocalRuntimeRoute(route) {
   return Boolean(route && LOCAL_RUNTIME_ENSURE.has(canonicalProviderId(route.provider)));
 }
 
-async function ensureLocalRouteRuntime(route) {
+// Local turns currently being served. Cancellation cleanup has to be able to
+// ask whether the slot it is about to reclaim belongs to somebody else still
+// waiting for an answer, and with `--parallel 1` a busy slot does not say which
+// turn is using it. Keyed on the request object so the state is request-scoped
+// and disappears with the request.
+const localTurnsInFlight = new Set();
+
+function otherLocalTurnsActive(request) {
+  for (const other of localTurnsInFlight) {
+    if (other !== request) return true;
+  }
+  return false;
+}
+
+async function ensureLocalRouteRuntime(route, request) {
   const provider = providerForModel(route);
   const ensure = provider ? LOCAL_RUNTIME_ENSURE.get(provider.id) : undefined;
   if (!ensure) return;
   try {
+    // A request arriving during a cancellation teardown waits for it rather
+    // than starting a server the teardown is about to stop.
+    if (request) {
+      const { awaitLocalRuntimeCleanup } = await import("./llamacpp-runtime.mjs");
+      await awaitLocalRuntimeCleanup();
+    }
     await ensure();
+    if (request) localTurnsInFlight.add(request);
   } catch (error) {
     // A local backend that cannot start is an operator-actionable condition,
     // not a proxy fault: say which command fixes it and where the log is.
@@ -3822,7 +3843,7 @@ async function prepareRoutedRequest({
   normalizedInput,
   agingEnabled,
 }) {
-  await ensureLocalRouteRuntime(route);
+  await ensureLocalRouteRuntime(route, request);
   const aged = ageToolResults(normalizedInput, {
     enabled: agingEnabled,
   });
@@ -5427,6 +5448,33 @@ async function handleResponses(request, response, requestUrl) {
   } finally {
     const status = activityStatus ?? finalStatus ?? response.statusCode;
     activity.finish(status);
+    // A local turn that ended because the client walked away leaves llama.cpp
+    // generating into an empty room. This build has no way to cancel inference
+    // and does not notice on its own, so the runtime reclaims the server it
+    // started after a short grace period. `clientGone` alone would miss the
+    // ordering where the socket closes as the pipeline is already unwinding,
+    // so the destroyed-without-finishing shape counts too -- the same reading
+    // the stream-error paths above use.
+    if (isLocalRuntimeRoute(route)) {
+      const cancelled = clientGone || (response.destroyed && !response.writableFinished);
+      localTurnsInFlight.delete(request);
+      const { cleanupAfterLocalCancellation, noteLocalRuntimeIdle } = await import(
+        "./llamacpp-runtime.mjs"
+      );
+      const otherTurnsActive = () => otherLocalTurnsActive(request);
+      if (cancelled) {
+        // Nobody is waiting on the response any more, so this must not hold the
+        // handler open.
+        void cleanupAfterLocalCancellation({ otherTurnsActive }).catch((error) => {
+          console.error(
+            `[codex-router] local cancellation cleanup failed: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        });
+      }
+      noteLocalRuntimeIdle({ otherTurnsActive });
+    }
     // Timestamped per-request timing for latency diagnosis. Never gated on
     // QUIET: the production LaunchAgent hard-sets CODEX_ROUTER_QUIET=1. A
     // missing provider count is logged as unknown, not zero; an explicit zero

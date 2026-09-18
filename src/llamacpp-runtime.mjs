@@ -60,10 +60,41 @@ export const LLAMACPP_CTX_SIZE = String(
 // Loading 11.27 GiB from disk takes tens of seconds on a warm page cache and
 // considerably longer when the machine has been doing other work, so the
 // readiness wait is generous. It is a ceiling, not an expectation.
-const START_TIMEOUT_MS = 180_000;
+const START_TIMEOUT_MS = Number(process.env.CODEX_ROUTER_LOCAL_START_TIMEOUT_MS) > 0
+  ? Number(process.env.CODEX_ROUTER_LOCAL_START_TIMEOUT_MS)
+  : 180_000;
 const PROBE_TIMEOUT_MS = 2_000;
 const STOP_TIMEOUT_MS = 20_000;
 const STOP_POLL_MS = 250;
+// Releasing the port is not the same event as the process leaving the process
+// table. An 11 GiB unload takes real time, and during that window a fresh server
+// binds nothing and dies at once with "couldn't bind HTTP server socket". A
+// retry storm followed one real slow start: every attempt spawned a server that
+// exited in four seconds, and the route stayed down until the port came back.
+const PORT_RELEASE_TIMEOUT_MS = 45_000;
+const PORT_RELEASE_POLL_MS = 500;
+
+// A cancelled Codex turn used to leave the model generating into the void.
+// llama.cpp 0.4.1 has no conversation-id or resumable-stream API to cancel
+// inference with, and it does not stop on its own when its HTTP caller
+// disappears: one stranded generation was still running 25 minutes after its
+// client was gone, holding a single slot and roughly 11 GiB of a 16 GB machine.
+// So after a cancellation the router waits out a short grace period and then
+// stops the runtime it started. Losing the prompt cache costs one cold start;
+// leaving the machine thrashing costs the machine.
+const CANCEL_GRACE_MS = Math.max(
+  0,
+  Number(process.env.CODEX_ROUTER_LOCAL_CANCEL_GRACE_MS ?? 10_000) || 0,
+);
+const CANCEL_POLL_MS = 1_000;
+
+// How long a managed runtime may sit with nothing to do before it gives the
+// memory back. Zero (or a negative value) disables the reaper and leaves the
+// model resident until the operator stops it.
+const IDLE_STOP_MS = Math.max(
+  0,
+  Number(process.env.CODEX_ROUTER_LOCAL_IDLE_MS ?? 15 * 60_000) || 0,
+);
 
 function message(error) {
   return error instanceof Error ? error.message : String(error);
@@ -216,11 +247,37 @@ function processResidentBytes(pid, { spawn = spawnSync } = {}) {
 // Stop only the exact server this router started. A healthy llama.cpp on our
 // port that carries no matching identity belongs to the operator or to another
 // tool, and is deliberately left running.
+//
+// The process leaving the process table and the port coming back are two
+// different moments, and the second one is what a restart actually needs. Every
+// path that stops our own server therefore waits for the port to stop answering
+// before it reports success; without that, the very next start races the
+// unload and dies on a bind error.
+export async function waitForLlamacppPortFree({
+  baseUrl = process.env.MODEL_ROUTER_LLAMACPP_BASE_URL || DEFAULT_LLAMACPP_BASE_URL,
+  fetchImpl = fetch,
+  timeoutMs = PORT_RELEASE_TIMEOUT_MS,
+  intervalMs = PORT_RELEASE_POLL_MS,
+} = {}) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const probe = await probeLlamacpp({ baseUrl, fetchImpl });
+    // Any HTTP answer, healthy or not, means somebody still holds the socket.
+    if (!probe.reachable) return true;
+    if (Date.now() >= deadline) return false;
+    await wait(intervalMs);
+  }
+}
+
 export async function stopManagedLlamacpp({
   identity = processStartIdentity,
   kill = process.kill,
   timeoutMs = STOP_TIMEOUT_MS,
   intervalMs = STOP_POLL_MS,
+  baseUrl = process.env.MODEL_ROUTER_LLAMACPP_BASE_URL || DEFAULT_LLAMACPP_BASE_URL,
+  fetchImpl = fetch,
+  portReleaseTimeoutMs = PORT_RELEASE_TIMEOUT_MS,
+  waitForPort = true,
 } = {}) {
   const state = readLlamacppRuntimeState();
   if (!state?.managed) return { stopped: false, reason: "external-or-unmanaged" };
@@ -255,13 +312,151 @@ export async function stopManagedLlamacpp({
     }
   }
   clearLlamacppRuntimeState();
-  return { stopped: true, pid: state.pid, forced };
+  const portFree = waitForPort
+    ? await waitForLlamacppPortFree({ baseUrl, fetchImpl, timeoutMs: portReleaseTimeoutMs })
+    : true;
+  return { stopped: true, pid: state.pid, forced, portFree };
 }
 
 function startingStateOwnedByLiveProcess({ identity }) {
   const state = readLlamacppRuntimeState();
   if (!llamacppRuntimeStateOwnsProcess(state, { identity })) return undefined;
   return state;
+}
+
+// The cheapest honest answer to "is the model still working?". llama.cpp
+// reports `is_processing` per slot, which is the same signal its own callers
+// read, and it costs one loopback GET. `busy: undefined` means the server
+// answered but the answer was unreadable; callers must treat that as unknown
+// rather than as evidence of an idle model.
+export async function llamacppSlotActivity({
+  baseUrl = process.env.MODEL_ROUTER_LLAMACPP_BASE_URL || DEFAULT_LLAMACPP_BASE_URL,
+  fetchImpl = fetch,
+  timeoutMs = PROBE_TIMEOUT_MS,
+} = {}) {
+  const root = llamacppRootUrl(baseUrl);
+  try {
+    const response = await fetchImpl(`${root}/slots`, {
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!response.ok) return { reachable: true, busy: undefined };
+    const payload = await response.json().catch(() => undefined);
+    if (!Array.isArray(payload)) return { reachable: true, busy: undefined };
+    return { reachable: true, busy: payload.some((slot) => slot?.is_processing === true) };
+  } catch {
+    // Nothing is listening, so nothing is generating.
+    return { reachable: false, busy: false };
+  }
+}
+
+// Serializes cancellation cleanup against the start path. A request that
+// arrives while a teardown is running waits for it rather than racing it into a
+// half-dead server, and the ordinary on-demand start then brings up a clean one.
+let cancellationCleanup = null;
+let idleTimer = null;
+
+export function localRuntimeCleanupInProgress() {
+  return cancellationCleanup !== null;
+}
+
+export function awaitLocalRuntimeCleanup() {
+  return cancellationCleanup ?? Promise.resolve({ cleaned: false, reason: "nothing-to-clean" });
+}
+
+// Test seam: the module holds process-wide state, and a suite that imports it
+// repeatedly must be able to start from a known place.
+export function resetLocalRuntimeLifecycleForTests() {
+  cancellationCleanup = null;
+  if (idleTimer) clearTimeout(idleTimer);
+  idleTimer = null;
+}
+
+// `otherTurnsActive` is the one thing this module cannot know on its own: with
+// `--parallel 1`, a slot that is busy might be busy with somebody else's turn,
+// and stopping the server would kill that turn instead of the stranded one.
+export function cleanupAfterLocalCancellation({
+  baseUrl = process.env.MODEL_ROUTER_LLAMACPP_BASE_URL || DEFAULT_LLAMACPP_BASE_URL,
+  fetchImpl = fetch,
+  identity = processStartIdentity,
+  kill = process.kill,
+  graceMs = CANCEL_GRACE_MS,
+  pollMs = CANCEL_POLL_MS,
+  otherTurnsActive = () => false,
+} = {}) {
+  if (cancellationCleanup) return cancellationCleanup;
+
+  const startedAt = Date.now();
+  const tracked = (async () => {
+    let last;
+    while (Date.now() - startedAt < graceMs) {
+      last = await llamacppSlotActivity({ baseUrl, fetchImpl });
+      // A model that stopped by itself needs nothing from us, and neither does
+      // a server that is no longer there.
+      if (last.busy !== true) {
+        return { cleaned: false, reason: "inference-stopped", waitedMs: Date.now() - startedAt };
+      }
+      await wait(pollMs);
+    }
+    if (otherTurnsActive()) {
+      // The slot is busy with a turn that is still wanted. Stopping the server
+      // would be a worse bug than the one being fixed.
+      return { cleaned: false, reason: "another-turn-active", waitedMs: Date.now() - startedAt };
+    }
+    const stopped = await stopManagedLlamacpp({ identity, kill });
+    return {
+      cleaned: Boolean(stopped.stopped),
+      reason: "runtime-stopped",
+      waitedMs: Date.now() - startedAt,
+      stopped,
+    };
+  })().finally(() => {
+    if (cancellationCleanup === tracked) cancellationCleanup = null;
+  });
+
+  cancellationCleanup = tracked;
+  return tracked;
+}
+
+async function stopIdleLlamacpp({
+  baseUrl,
+  fetchImpl,
+  identity,
+  kill,
+  otherTurnsActive,
+} = {}) {
+  // A teardown or a live turn outranks the idle timer; the timer is re-armed by
+  // whichever of them finishes last.
+  if (cancellationCleanup || otherTurnsActive?.()) return;
+  const activity = await llamacppSlotActivity({ baseUrl, fetchImpl });
+  if (activity.busy === true) return;
+  await stopManagedLlamacpp({ identity, kill });
+}
+
+// Re-armed on every local turn boundary, so a new request cancels the
+// countdown simply by arriving.
+export function noteLocalRuntimeIdle({
+  baseUrl = process.env.MODEL_ROUTER_LLAMACPP_BASE_URL || DEFAULT_LLAMACPP_BASE_URL,
+  fetchImpl = fetch,
+  identity = processStartIdentity,
+  kill = process.kill,
+  idleMs = IDLE_STOP_MS,
+  otherTurnsActive = () => false,
+} = {}) {
+  if (idleTimer) clearTimeout(idleTimer);
+  idleTimer = null;
+  if (!(idleMs > 0)) return;
+  idleTimer = setTimeout(() => {
+    idleTimer = null;
+    stopIdleLlamacpp({ baseUrl, fetchImpl, identity, kill, otherTurnsActive }).catch(() => {
+      // A reaper that throws must not take the router down with it; the next
+      // turn boundary arms another one.
+    });
+  }, idleMs);
+  idleTimer.unref?.();
+}
+
+export function localRuntimeIdleStopMs() {
+  return IDLE_STOP_MS;
 }
 
 async function waitForLlamacppReady({
@@ -300,6 +495,7 @@ export async function startManagedLlamacpp({
   launcher = LLAMACPP_LAUNCHER,
   processIdentity = (pid) =>
     processStartIdentity(pid, { spawn: spawnSyncImpl, platform }),
+  kill = process.kill,
   timeoutMs = START_TIMEOUT_MS,
   expectedModel = DEFAULT_LLAMACPP_MODEL,
 } = {}) {
@@ -392,15 +588,19 @@ export async function startManagedLlamacpp({
     pid: spawnedPid,
   });
   if (!ready.ready) {
-    const state = readLlamacppRuntimeState();
-    if (llamacppRuntimeStateOwnsProcess(state, { identity: processIdentity })) {
-      try {
-        process.kill(state.pid, "SIGTERM");
-      } catch {
-        // Best effort.
-      }
-    }
-    clearLlamacppRuntimeState();
+    // Give up on this attempt, but leave the port actually free: a retry that
+    // arrives while the failed server is still unholding 8080 would die on a
+    // bind error and look like a second, unrelated failure.
+    await stopManagedLlamacpp({
+      identity: processIdentity,
+      kill,
+      baseUrl,
+      fetchImpl,
+    }).catch(() => {
+      // A stop that cannot even find its own state still has to report the
+      // original startup failure.
+      clearLlamacppRuntimeState();
+    });
     throw new Error(
       `llama.cpp was started but never became healthy${ready.error ? `: ${ready.error}` : "."} ` +
         `Logs: ${LLAMACPP_LOG_PATH}`,
@@ -446,6 +646,7 @@ export async function llamacppStatus({
 
   let served;
   if (probe.ready) served = await llamacppServedModels({ baseUrl, fetchImpl });
+  const activity = probe.ready ? await llamacppSlotActivity({ baseUrl, fetchImpl }) : undefined;
   const mismatched =
     Boolean(probe.ready && expectedModel && served?.models?.length) &&
     !served.models.includes(expectedModel);
@@ -471,6 +672,12 @@ export async function llamacppStatus({
     baseUrl: llamacppRootUrl(baseUrl),
     model: expectedModel,
     servedModels: served?.models,
+    // Whether the one slot is actually generating. This is the reading that
+    // explains a machine that feels busy while `local-llamacpp status` says
+    // healthy, and the reading a cancelled turn should have left false.
+    activeInference: activity?.busy,
+    cleanupInProgress: localRuntimeCleanupInProgress(),
+    idleStopMs: localRuntimeIdleStopMs(),
     uptimeMs: owned && state?.startedAt ? Date.now() - state.startedAt : undefined,
     // Deliberately named for what it is. This is the server process's resident
     // set, and llama.cpp's Metal buffers are not all counted in it, so the

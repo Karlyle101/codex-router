@@ -198,6 +198,7 @@ next write.
 
 
 
+
 ## GPT-OSS-20B on llama.cpp
 
 `llamacpp/gpt-oss-20b` is a local route served by llama.cpp rather than Ollama
@@ -336,3 +337,78 @@ routed path survived the same kind of prefill because the router keeps the
 client's stream alive; nothing keeps it alive when the client talks to
 llama.cpp directly. Use the direct profile to isolate a fault, not as the
 everyday path.
+
+### Stopping a local turn
+
+llama.cpp does not cancel inference when its caller disappears, and version
+0.4.1 has no conversation-id or resumable-stream API to cancel it with. A
+cancelled Codex turn therefore used to leave the model generating into an empty
+room: one stranded generation was observed still running **25 minutes** after
+its client was gone, holding the single slot and about 11 GiB of a 16 GB
+machine.
+
+What happens now, from the moment you press Stop or close the window:
+
+```text
+client disconnects
+  → router records canceled / client_disconnected   (measured: 141 ms)
+  → aborts its own upstream request
+  → waits CODEX_ROUTER_LOCAL_CANCEL_GRACE_MS        (default 10 s)
+       polling /slots for `is_processing`
+  → if the slot is still generating: stop the managed runtime
+  → wait for port 8080 to stop answering, then release
+```
+
+Measured end to end on this machine: cancel at 18:55:37, the server was gone by
+18:56:22, and system memory went from 6% free to 30% as the 11 GiB came back.
+
+Cancellation is request-scoped. Each turn carries its own controller, and the
+timer, the heartbeat, and the cleanup all belong to that request. Two rules keep
+the cleanup from becoming a worse bug than the one it fixes:
+
+* a slot that is busy with **another live local turn** is never reclaimed, so a
+  cancellation cannot kill the next request;
+* a request arriving during a teardown **waits** for it, then takes the ordinary
+  on-demand start, so it can never attach to a half-dead server.
+
+### Idle shutdown
+
+The model does not need to hold 11 GiB while you are doing something else. After
+the last local turn ends, an idle timer starts; a new local turn cancels it by
+arriving, and it never fires while the slot is busy or a teardown is running.
+
+```text
+CODEX_ROUTER_LOCAL_IDLE_MS              900000   (15 minutes; 0 disables)
+CODEX_ROUTER_LOCAL_CANCEL_GRACE_MS       10000
+CODEX_ROUTER_LOCAL_TRANSPORT_IDLE_MS   prelude + 60 s
+CODEX_ROUTER_LOCAL_START_TIMEOUT_MS     180000
+```
+
+Nothing starts at login, and manual start/stop still work exactly as before.
+
+### Qualification
+
+`test/qualification/local-model-qualification.mjs` is the reproducible
+capability check. It builds throwaway fixtures under the system temp directory
+(never a real project), runs each task through the routed model, and decides
+PASS from the transcript and the file system afterwards -- a command printed in
+prose is not execution, and a test that only exists in the transcript does not
+count.
+
+```text
+node test/qualification/local-model-qualification.mjs
+```
+
+The run prints a table and writes `test/qualification/last-run.json`.
+
+`QUALIFY_ONLY=Q1,Q3`, `QUALIFY_TIMEOUT_MS`, and `QUALIFY_MODEL` narrow a run.
+Tasks share one working root on purpose: the cwd is part of Codex's environment
+context, so a fresh directory per task would make the model re-read its whole
+8.5K-token preamble seven times.
+
+The suite has not yet produced a clean full run on this machine. A gated run
+recorded Q1 as FAIL: it hit the six-minute bound with zero tool calls, because
+the model was still loading under memory pressure that had system memory at 5%
+free and swap nearly full. That is a machine-state result, not a capability
+verdict, and it should be read that way. Re-run the suite on an otherwise idle
+machine before drawing conclusions about the model.
